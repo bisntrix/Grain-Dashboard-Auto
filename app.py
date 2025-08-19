@@ -50,24 +50,42 @@ def fetch_table(url, source_label):
     return pd.DataFrame()
 
 def _best_series(frame: pd.DataFrame, colname: str) -> pd.Series:
-    """Return a clean numeric Series for the given column name even if the raw selection is a DataFrame (duplicate headers)."""
+    """Return a clean numeric Series even if the selection yields a DataFrame due to duplicate column names."""
     if colname not in frame.columns:
         return pd.Series(index=frame.index, dtype=float)
     obj = frame[colname]
     if isinstance(obj, pd.DataFrame):
-        # Try to coalesce multiple same-named columns: choose the one with most numeric values
+        # Multiple columns share the same name; choose the first with most numeric entries
         numeric = obj.apply(pd.to_numeric, errors="coerce")
-        # pick column with most non-nulls; if tie, first
-        best_col = numeric.notna().sum().idxmax()
-        s = numeric[best_col]
+        counts = numeric.notna().sum(axis=0)
+        # If all NaN, just pick the first column
+        if counts.max() <= 0:
+            s = numeric.iloc[:, 0]
+        else:
+            # Identify columns whose name equals colname (there may be duplicates)
+            same_name_positions = [i for i, c in enumerate(obj.columns) if c == colname]
+            # Rank by numeric counts across those positions
+            if same_name_positions:
+                best_pos = max(same_name_positions, key=lambda i: counts.iloc[i])
+                s = numeric.iloc[:, best_pos]
+            else:
+                # Fallback: column with max numeric count overall
+                best_pos = int(counts.values.argmax())
+                s = numeric.iloc[:, best_pos]
     else:
         s = pd.Series(obj)
-    # strip formatting and coerce
-    s = s.astype(str)         .str.replace(",", "", regex=False)         .str.replace("$", "", regex=False)         .str.replace("¢", "", regex=False)         .str.extract(r"([-+]?\d*\.?\d+)")[0]
+    # Strip formatting and coerce to numeric
+    s = (
+        s.astype(str)
+         .str.replace(",", "", regex=False)
+         .str.replace("$", "", regex=False)
+         .str.replace("¢", "", regex=False)
+         .str.extract(r"([-+]?\d*\.?\d+)")[0]
+    )
     return pd.to_numeric(s, errors="coerce")
 
 @st.cache_data(ttl=300, show_spinner=False)
-def aggregate_bids_v3():
+def aggregate_bids_v4():
     sources = [
         ("https://www.dunkertoncoop.com/markets/cashgrid.php?commodity_filter=", "Dunkerton Co-op"),
         ("https://www.heartlandcoop.com/markets/cash.php?location_filter=19834", "Heartland – Washburn"),
@@ -84,7 +102,7 @@ def aggregate_bids_v3():
         return pd.DataFrame()
     raw = pd.concat(parts, ignore_index=True).dropna(how="all")
 
-    # Normalize
+    # Normalize headers
     df = raw.copy()
     df.columns = [str(c).strip() for c in df.columns]
     rename = {}
@@ -97,7 +115,7 @@ def aggregate_bids_v3():
         if c == "Name": rename[c] = "Name"
     df = df.rename(columns=rename)
 
-    # Clean numerics using robust selector
+    # Robust numeric cleaning
     if "Futures" in df.columns:
         df["Futures"] = _best_series(df, "Futures")
     if "Basis" in df.columns:
@@ -105,20 +123,17 @@ def aggregate_bids_v3():
     if "Cash" in df.columns:
         df["Cash"] = _best_series(df, "Cash")
 
-    # Create basis cents
+    # Basis cents
     if "Futures" in df.columns and "Cash" in df.columns:
         df["Basis (¢/bu)"] = (df["Cash"] - df["Futures"]) * 100.0
     elif "Basis" in df.columns:
         df["Basis (¢/bu)"] = df["Basis"]
 
-    # Guarantee source cols
     for c in ["source", "source_url"]:
         if c not in df.columns:
             df[c] = ""
 
-    # Timestamp
     df["Fetched"] = pd.Timestamp.utcnow().tz_localize(None)
-
     return df
 
 with st.sidebar:
@@ -132,7 +147,7 @@ Corn: `ZC=F`  |  Soybeans: `ZS=F`
         st.rerun()
     export_btn = st.empty()
 
-st.title("🌽 Grain Marketing Dashboard — Auto (clean v3)")
+st.title("🌽 Grain Marketing Dashboard — Auto (clean v4)")
 st.caption("Auto-fetches public cash-bid tables when available.")
 
 corn = get_futures_quote("ZC=F")
@@ -155,7 +170,7 @@ with f_right:
 st.write("---")
 st.subheader("Auto-fetched Cash Bids (beta)")
 
-agg = aggregate_bids_v3()
+agg = aggregate_bids_v4()
 if agg.empty:
     st.warning("No public tables fetched right now. Some sources may require login or block scraping. Try again later or upload CSV in the manual app.")
 else:
