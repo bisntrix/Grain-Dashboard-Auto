@@ -8,7 +8,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Grain Marketing Dashboard (Auto)", layout="wide")
 
-@st.cache_data(ttl=90)
+@st.cache_data(ttl=90, show_spinner=False)
 def get_futures_quote(symbol: str) -> dict:
     try:
         t = yf.Ticker(symbol)
@@ -49,8 +49,25 @@ def fetch_table(url, source_label):
         pass
     return pd.DataFrame()
 
+def _best_series(frame: pd.DataFrame, colname: str) -> pd.Series:
+    """Return a clean numeric Series for the given column name even if the raw selection is a DataFrame (duplicate headers)."""
+    if colname not in frame.columns:
+        return pd.Series(index=frame.index, dtype=float)
+    obj = frame[colname]
+    if isinstance(obj, pd.DataFrame):
+        # Try to coalesce multiple same-named columns: choose the one with most numeric values
+        numeric = obj.apply(pd.to_numeric, errors="coerce")
+        # pick column with most non-nulls; if tie, first
+        best_col = numeric.notna().sum().idxmax()
+        s = numeric[best_col]
+    else:
+        s = pd.Series(obj)
+    # strip formatting and coerce
+    s = s.astype(str)         .str.replace(",", "", regex=False)         .str.replace("$", "", regex=False)         .str.replace("¢", "", regex=False)         .str.extract(r"([-+]?\d*\.?\d+)")[0]
+    return pd.to_numeric(s, errors="coerce")
+
 @st.cache_data(ttl=300, show_spinner=False)
-def aggregate_bids():
+def aggregate_bids_v3():
     sources = [
         ("https://www.dunkertoncoop.com/markets/cashgrid.php?commodity_filter=", "Dunkerton Co-op"),
         ("https://www.heartlandcoop.com/markets/cash.php?location_filter=19834", "Heartland – Washburn"),
@@ -80,25 +97,21 @@ def aggregate_bids():
         if c == "Name": rename[c] = "Name"
     df = df.rename(columns=rename)
 
-    # Clean numerics
-    for col in ["Futures", "Basis", "Cash"]:
-        if col in df.columns:
-            df[col] = (
-                df[col].astype(str)
-                .str.replace(",", "", regex=False)
-                .str.replace("$", "", regex=False)
-                .str.replace("¢", "", regex=False)
-                .str.extract(r"([-+]?\d*\.?\d+)")[0]
-            )
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Clean numerics using robust selector
+    if "Futures" in df.columns:
+        df["Futures"] = _best_series(df, "Futures")
+    if "Basis" in df.columns:
+        df["Basis"] = _best_series(df, "Basis")
+    if "Cash" in df.columns:
+        df["Cash"] = _best_series(df, "Cash")
 
-    # Create Basis (¢/bu)
+    # Create basis cents
     if "Futures" in df.columns and "Cash" in df.columns:
         df["Basis (¢/bu)"] = (df["Cash"] - df["Futures"]) * 100.0
     elif "Basis" in df.columns:
         df["Basis (¢/bu)"] = df["Basis"]
 
-    # Ensure source cols
+    # Guarantee source cols
     for c in ["source", "source_url"]:
         if c not in df.columns:
             df[c] = ""
@@ -114,9 +127,12 @@ with st.sidebar:
 **Futures symbols**  
 Corn: `ZC=F`  |  Soybeans: `ZS=F`
 """)
+    if st.button("Clear cache & refresh"):
+        st.cache_data.clear()
+        st.rerun()
     export_btn = st.empty()
 
-st.title("🌽 Grain Marketing Dashboard — Auto (clean)")
+st.title("🌽 Grain Marketing Dashboard — Auto (clean v3)")
 st.caption("Auto-fetches public cash-bid tables when available.")
 
 corn = get_futures_quote("ZC=F")
@@ -139,11 +155,11 @@ with f_right:
 st.write("---")
 st.subheader("Auto-fetched Cash Bids (beta)")
 
-agg = aggregate_bids()
+agg = aggregate_bids_v3()
 if agg.empty:
     st.warning("No public tables fetched right now. Some sources may require login or block scraping. Try again later or upload CSV in the manual app.")
 else:
-    desired = ["Name", "Commodity", "Basis Month", "Futures", "Basis (¢/bu)", "Cash", "source", "source_url"]
+    desired = ["Name", "Commodity", "Basis Month", "Futures", "Basis (¢/bu)", "Cash", "source", "source_url", "Fetched"]
     have = [c for c in desired if c in agg.columns]
     table = agg.loc[:, have].copy()
     st.dataframe(table, use_container_width=True, height=420)
