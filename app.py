@@ -102,7 +102,7 @@ def aggregate_bids():
 
 with st.sidebar:
     st.title("⚙️ Settings")
-    st.markdown("**Futures symbols**  
+    st.markdown("**Futures symbols**  \nCorn: `ZC=F`  |  Soybeans: `ZS=F`")  
 Corn: ZC=F  |  Soybeans: ZS=F")
     export_btn = st.empty()
 
