@@ -1,4 +1,4 @@
-# app.py (patched to avoid KeyError on missing columns)
+# app.py
 import io, math
 from datetime import datetime
 import pandas as pd
@@ -39,7 +39,7 @@ def fetch_table(url, source_label):
         frames = []
         for t in pd.read_html(url, flavor="lxml"):
             cols = [c.lower() for c in t.columns.astype(str)]
-            if any("cash" in c for c in cols) or any("basis" in c for c in cols) or any("bid" in c for c in cols):
+            if any(k in c for c in cols for k in ["cash", "basis", "bid"]):
                 t["source"] = source_label
                 t["source_url"] = url
                 frames.append(t)
@@ -66,7 +66,8 @@ def aggregate_bids():
     if not parts:
         return pd.DataFrame()
     raw = pd.concat(parts, ignore_index=True).dropna(how="all")
-    # Normalize loose columns
+
+    # Normalize
     df = raw.copy()
     df.columns = [str(c).strip() for c in df.columns]
     rename = {}
@@ -78,6 +79,7 @@ def aggregate_bids():
         if "month" in cl and "basis" in cl: rename[c] = "Basis Month"
         if c == "Name": rename[c] = "Name"
     df = df.rename(columns=rename)
+
     # Clean numerics
     for col in ["Futures", "Basis", "Cash"]:
         if col in df.columns:
@@ -89,24 +91,32 @@ def aggregate_bids():
                 .str.extract(r"([-+]?\d*\.?\d+)")[0]
             )
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    # Create Basis (¢/bu) if possible
+
+    # Create Basis (¢/bu)
     if "Futures" in df.columns and "Cash" in df.columns:
         df["Basis (¢/bu)"] = (df["Cash"] - df["Futures"]) * 100.0
     elif "Basis" in df.columns:
         df["Basis (¢/bu)"] = df["Basis"]
-    # Ensure source columns exist
+
+    # Ensure source cols
     for c in ["source", "source_url"]:
         if c not in df.columns:
             df[c] = ""
+
+    # Timestamp
+    df["Fetched"] = pd.Timestamp.utcnow().tz_localize(None)
+
     return df
 
 with st.sidebar:
     st.title("⚙️ Settings")
-    st.markdown("**Futures symbols**  \nCorn: `ZC=F`  |  Soybeans: `ZS=F`")  
-Corn: ZC=F  |  Soybeans: ZS=F")
+    st.markdown("""
+**Futures symbols**  
+Corn: `ZC=F`  |  Soybeans: `ZS=F`
+""")
     export_btn = st.empty()
 
-st.title("🌽 Grain Marketing Dashboard — Auto (patched)")
+st.title("🌽 Grain Marketing Dashboard — Auto (clean)")
 st.caption("Auto-fetches public cash-bid tables when available.")
 
 corn = get_futures_quote("ZC=F")
@@ -135,10 +145,8 @@ if agg.empty:
 else:
     desired = ["Name", "Commodity", "Basis Month", "Futures", "Basis (¢/bu)", "Cash", "source", "source_url"]
     have = [c for c in desired if c in agg.columns]
-    # Avoid KeyError: select only existing columns
     table = agg.loc[:, have].copy()
     st.dataframe(table, use_container_width=True, height=420)
-    # Export
     csv_buf = io.StringIO()
     table.to_csv(csv_buf, index=False)
     export_btn.download_button("⬇️ Download fetched bids (CSV)", data=csv_buf.getvalue(), file_name="fetched_bids.csv", mime="text/csv")
