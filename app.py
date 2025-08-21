@@ -148,19 +148,18 @@ with st.status("Fetching live cash bids…", expanded=False):
         except Exception as e:
             errors.append(f"{fetcher.__name__}: {e}")
 
-    if not collected:
-        with st.expander("Live fetch diagnostics", expanded=True):
-            if errors:
-                st.write("Fetch issues:", errors)
-            else:
-                st.write("No live tables were collected (no errors reported).")
-        # Fallback demo rows so the app still renders
-        bids_table = pd.DataFrame([
-            {"Location":"ADM Cedar Rapids","Commodity":"CORN","FuturesMonth":"Dec","Futures":4.60,"Basis":-0.12,"Cash":4.48},
-            {"Location":"Cargill Cedar Rapids (Soy)","Commodity":"SOYBEANS","FuturesMonth":"Nov","Futures":11.50,"Basis":-0.08,"Cash":11.42},
-        ])
-    else:
-        bids_table = pd.concat(collected, ignore_index=True)
+# ---- AFTER status block: build bids_table and show any diagnostics ----
+if not collected:
+    st.warning("No live tables were collected. Showing diagnostics and fallback demo rows.")
+    if errors:
+        st.write("Fetch issues:")
+        st.code("\n".join(errors))
+    bids_table = pd.DataFrame([
+        {"Location":"ADM Cedar Rapids","Commodity":"CORN","FuturesMonth":"Dec","Futures":4.60,"Basis":-0.12,"Cash":4.48},
+        {"Location":"Cargill Cedar Rapids (Soy)","Commodity":"SOYBEANS","FuturesMonth":"Nov","Futures":11.50,"Basis":-0.08,"Cash":11.42},
+    ])
+else:
+    bids_table = pd.concat(collected, ignore_index=True)
 # Fallback demo rows if still empty:
 if bids_table.empty:
     bids_table = pd.DataFrame([
