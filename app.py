@@ -18,6 +18,10 @@ def display_dataframe_safe(df: pd.DataFrame, *, mode: str = "suffix", **st_kwarg
     # warn if duplicates were fixed
     orig_cols = pd.Series(df.columns)
     dups = orig_cols[orig_cols.duplicated(keep=False)]
+    if not dups.empty:
+        st.warning(f"Duplicate column names were auto-fixed: {sorted(set(dups))}", icon="⚠️")
+
+    st.dataframe(df, **st_kwargs)
 
 # ... your existing imports and code above ...
 
