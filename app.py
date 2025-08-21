@@ -15,16 +15,29 @@ import streamlit as st
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; GrainDashboard/1.0)"}
 
 def _read_html_first_table(url: str) -> pd.DataFrame:
-    # Many Agricharts/Barchart pages expose an HTML <table> we can read directly
-    res = requests.get(url, headers=HEADERS, timeout=20)
-    res.raise_for_status()
-    # read_html returns a list; pick the widest table which usually is the grid
-    tables = pd.read_html(res.text)
-    if not tables:
-        raise ValueError(f"No HTML tables found at {url}")
-    df = max(tables, key=lambda t: t.shape[1])
-    df["__source_url__"] = url
-    return df
+    # Try a few variants that often expose a clean server-rendered table
+    candidates = [url]
+    if "print=true" not in url:
+        sep = "&" if "?" in url else "?"
+        candidates.append(f"{url}{sep}print=true")
+    if "showcwt" not in url:
+        sep = "&" if "?" in url else "?"
+        candidates.append(f"{url}{sep}showcwt=0")
+
+    last_err = None
+    for u in candidates:
+        try:
+            res = requests.get(u, headers=HEADERS, timeout=20)
+            res.raise_for_status()
+            tables = pd.read_html(res.text)
+            if tables:
+                df = max(tables, key=lambda t: t.shape[1]).copy()
+                df["__source_url__"] = u
+                return df
+        except Exception as e:
+            last_err = e
+            continue
+    raise ValueError("No tables found")
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_adm_cedar_rapids() -> pd.DataFrame:
