@@ -6,10 +6,21 @@ def enforce_unique_columns(df: pd.DataFrame, mode: str = "suffix") -> pd.DataFra
         return df
     df = df.copy()
     if mode == "drop":
-        df = df.loc[:, ~pd.Index(df.columns).duplicated()].copy()
+        # Drop duplicate columns, keep first
+        return df.loc[:, ~df.columns.duplicated()].copy()
+    else:
+        # Rename duplicates with suffixes: e.g., Bid, Bid_1, Bid_2
+        seen = {}
+        new_cols = []
+        for col in df.columns:
+            if col in seen:
+                seen[col] += 1
+                new_cols.append(f"{col}_{seen[col]}")
+            else:
+                seen[col] = 0
+                new_cols.append(col)
+        df.columns = new_cols
         return df
-    df.columns = pd.io.parsers.ParserBase({'names': df.columns})._maybe_dedup_names(df.columns)
-    return df
 
 def display_dataframe_safe(df: pd.DataFrame, *, mode: str = "suffix", **st_kwargs):
     if df is None:
