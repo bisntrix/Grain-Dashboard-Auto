@@ -118,27 +118,49 @@ def _normalize(df: pd.DataFrame, location_label: str = None) -> pd.DataFrame:
     return out
 
 with st.status("Fetching live cash bids…", expanded=False):
-    frames = []
+    collected, errors = [], []
     for fetcher in [
         fetch_adm_cedar_rapids,
         fetch_cargill_cr_soy,
         fetch_dunkerton,
         fetch_heartland_washburn,
         fetch_mid_iowa_la_porte_city,
-        fetch_srsp_via_mid_iowa,   # may be empty if Mid-Iowa isn’t listing SRSP today
+        fetch_srsp_via_mid_iowa,
         fetch_poet_fairbank,
         fetch_poet_shell_rock,
     ]:
         try:
             raw = fetcher()
-            # location label already assigned by fetcher()
-            loc = raw.get("Location", [None])[0] if not isinstance(raw.get("Location"), str) else raw.get("Location")
-            frames.append(_normalize(raw, location_label=loc if isinstance(loc, str) else None))
+            if raw is None or raw.empty:
+                errors.append(f"{fetcher.__name__}: empty")
+                continue
+            loc_label = None
+            if "Location" in raw.columns:
+                try:
+                    loc_label = raw["Location"].iloc[0] if len(raw) else None
+                except Exception:
+                    pass
+            norm = _normalize(raw, location_label=loc_label)
+            if norm is not None and not norm.empty:
+                collected.append(norm)
+            else:
+                errors.append(f"{fetcher.__name__}: normalized empty")
         except Exception as e:
-            st.warning(f"Skipped {fetcher.__name__}: {e}")
+            errors.append(f"{fetcher.__name__}: {e}")
 
-    bids_table = pd.concat([f for f in frames if f is not None and not f.empty], ignore_index=True)
-
+    if not collected:
+        with st.expander("Live fetch diagnostics", expanded=True):
+            if errors:
+                st.write("Fetch issues:", errors)
+            else:
+                st.write("No live tables were collected (no errors reported).")
+        # Fallback demo rows so the app still renders
+        bids_table = pd.DataFrame([
+            {"Location":"ADM Cedar Rapids","Commodity":"CORN","FuturesMonth":"Dec","Futures":4.60,"Basis":-0.12,"Cash":4.48},
+            {"Location":"Cargill Cedar Rapids (Soy)","Commodity":"SOYBEANS","FuturesMonth":"Nov","Futures":11.50,"Basis":-0.08,"Cash":11.42},
+        ])
+    else:
+        bids_table = pd.concat(collected, ignore_index=True)
 # Fallback demo rows if still empty:
 if bids_table.empty:
     bids_table = pd.DataFrame([
