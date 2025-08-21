@@ -1,6 +1,24 @@
 import streamlit as st
 import pandas as pd
 
+def display_dataframe_safe(df: pd.DataFrame, *, mode: str = "suffix", **st_kwargs):
+    """Show a DataFrame in Streamlit, fixing duplicate column names automatically."""
+    if df is None:
+        st.info("No data to display.")
+        return
+
+    df = df.copy()
+    if mode == "drop":
+        # drop extra columns if names are duplicated
+        df = df.loc[:, ~pd.Index(df.columns).duplicated()].copy()
+    else:
+        # rename duplicates with suffixes (Bid, Bid.1, Bid.2, …)
+        df.columns = pd.io.parsers.ParserBase({'names': df.columns})._maybe_dedup_names(df.columns)
+
+    # warn if duplicates were fixed
+    orig_cols = pd.Series(df.columns)
+    dups = orig_cols[orig_cols.duplicated(keep=False)]
+
 # ... your existing imports and code above ...
 
 # Assume `table` has already been created at this point
