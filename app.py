@@ -8,4 +8,8 @@ from patch_duplicate_columns import display_dataframe_safe
 # table = build_table_somehow()
 
 # When ready to display the DataFrame:
-display_dataframe_safe(table, use_container_width=True, height=420)
+import pandas as pd  # (safe if already imported)
+from patch_duplicate_columns import display_dataframe_safe
+
+if 'table' in globals() and isinstance(table, pd.DataFrame):
+    display_dataframe_safe(table, use_container_width=True, height=420)
