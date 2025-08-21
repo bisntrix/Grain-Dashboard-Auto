@@ -53,13 +53,18 @@ def fetch_cargill_cr_soy() -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_dunkerton() -> pd.DataFrame:
-    url = "https://dunkertoncoop.agricharts.com/markets/cash.php?location_filter=35525"
+    # Clean table present; print mode simplifies HTML
+    url = "https://www.dunkertoncoop.com/markets/cash.php"
     return _read_html_first_table(url).assign(Location="Dunkerton Coop")
+# Source page shows the cash prices table. :contentReference[oaicite:0]{index=0}
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_heartland_washburn() -> pd.DataFrame:
+    # Heartland’s ‘cash.php?location_filter=…’ pages render the same grid;
+    # use a location_filter that corresponds to Washburn.
     url = "https://www.heartlandcoop.com/markets/cash.php?location_filter=19834"
     return _read_html_first_table(url).assign(Location="Heartland Coop (Washburn)")
+# Heartland cash pages expose tables and support print mode; example cash.php endpoints shown. :contentReference[oaicite:3]{index=3}
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_mid_iowa_la_porte_city() -> pd.DataFrame:
@@ -76,6 +81,7 @@ def fetch_poet_fairbank() -> pd.DataFrame:
 def fetch_poet_shell_rock() -> pd.DataFrame:
     url = "https://www.farmerswin.com/markets/cash.php?location_filter=79180"
     return _read_html_first_table(url).assign(Location="POET Shell Rock (Corn)")
+# Shell Rock page has a standard Name/Delivery/Futures/Basis/$ Price table. :contentReference[oaicite:1]{index=1}
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_srsp_via_mid_iowa() -> pd.DataFrame:
