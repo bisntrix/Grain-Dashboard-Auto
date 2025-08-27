@@ -23,7 +23,7 @@ st.set_page_config(page_title="Grain Marketing Dashboard", layout="wide")
 COOPS: List[Dict[str, str]] = [
     {"name": "ADM Cedar Rapids",            "url": "https://<ADM BIDS PAGE>",                   "location": "ADM Cedar Rapids"},
     {"name": "Cargill Cedar Rapids (Soy)",  "url": "https://<CARGILL SOY BIDS PAGE>",           "location": "Cargill Cedar Rapids (Soy)"},
-    {"name": "Dunkerton Coop",              "url": "https://<DUNKERTON BIDS PAGE>",             "location": "Dunkerton Coop"},
+    {"name": "Dunkerton Coop",              "url": "https://www.dunkertoncoop.com/CashBids",             "location": "Dunkerton Coop"},
     {"name": "Heartland (Washburn)",        "url": "https://<HEARTLAND WASHBURN BIDS>",         "location": "Heartland Coop Washburn"},
     {"name": "Mid-Iowa (La Porte City)",    "url": "https://<MID IOWA LPC BIDS>",               "location": "Mid-Iowa Coop La Porte City"},
     {"name": "Shell Rock Soy Processing",   "url": "https://<SRSP BIDS PAGE>",                  "location": "Shell Rock Soy Processing"},
