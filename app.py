@@ -11,7 +11,6 @@ from debug_shim import display_dataframe_safe
 
 st.set_page_config(page_title="Grain Marketing Dashboard", layout="wide")
 
-# ── CONFIG: Dunkerton URL ──────────────────────────────────────────────────
 COOPS: List[Dict[str, str]] = [
     {"name": "Dunkerton Co-op (Source)", "url": "https://www.dunkertoncoop.com/CashBids", "location": "Dunkerton Co-op"},
 ]
@@ -25,6 +24,10 @@ PROCESSOR_PATTERNS = [
     {"name": "Shell Rock Soy Processing", "patterns": [r"shell\s*rock\s*soy", r"\bsrsp\b"]},
 ]
 
+def _series_or_first_col(x):
+    # If selecting a label with duplicate columns produced a DataFrame, take first col as Series
+    return x.iloc[:,0] if isinstance(x, pd.DataFrame) else x
+
 def route_rows_to_processors(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
     cols = {c.lower(): c for c in df.columns}
@@ -32,9 +35,9 @@ def route_rows_to_processors(df: pd.DataFrame) -> pd.DataFrame:
     location_col = cols.get("location")
     work = df.copy()
     if delivery_col:
-        text = work[delivery_col].astype(str)
+        text = _series_or_first_col(work[delivery_col].astype(str))
     elif location_col:
-        text = work[location_col].astype(str)
+        text = _series_or_first_col(work[location_col].astype(str))
     else:
         text = work.select_dtypes(include=["object"]).astype(str).apply(lambda r: " | ".join(r.values), axis=1)
     text_norm = (text.str.lower().str.replace(r"[\u2013\u2014–—]+", "-", regex=True).str.replace(r"\s+", " ", regex=True).str.strip())
@@ -42,7 +45,7 @@ def route_rows_to_processors(df: pd.DataFrame) -> pd.DataFrame:
     resolved_location = pd.Series(pd.NA, index=work.index)
     for proc in PROCESSOR_PATTERNS:
         combined = re.compile("|".join(proc["patterns"]), flags=re.I)
-        hit = text_norm.str_contains(combined, na=False) if hasattr(text_norm, "str_contains") else text_norm.str.contains(combined, na=False)
+        hit = text_norm.str.contains(combined, na=False)
         resolved_location.loc[hit] = proc["name"]
         keep_mask = keep_mask | hit
     out = work[keep_mask].copy()
@@ -122,14 +125,11 @@ if not manual_df.empty: table = pd.concat([table, manual_df], ignore_index=True)
 
 table = patch_duplicate_columns(table)
 
-# Try routing to processors (ADM/Cargill/SRSP). If routes found, use them.
 routed = route_rows_to_processors(table)
 if not routed.empty: table = routed
 
-# Diagnostics expander: always show fetch issues and a quick raw HTML probe
 with st.expander("Live Fetch Debug"):
     st.write("Issues:", issues or "None")
-    # Quick raw probe so you can see if the page has <table> or a 403/JS wall
     try:
         r = requests.get(COOPS[0]["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
         st.write({"status_code": r.status_code, "len": len(r.text), "has_<table>": "<table" in r.text.lower()})
