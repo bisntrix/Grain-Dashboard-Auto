@@ -11,18 +11,14 @@ from debug_shim import display_dataframe_safe
 
 st.set_page_config(page_title="Grain Marketing Dashboard", layout="wide")
 
-# ── CONFIG ──────────────────────────────────────────────────────────────────
+# ── CONFIG: Dunkerton URL prefilled ────────────────────────────────────────
 COOPS: List[Dict[str, str]] = [
-    # Replace URL values with your actual Cash/Grain Bids pages
-    {"name": "Dunkerton Coop",              "url": "https://<DUNKERTON BIDS PAGE>",             "location": "Dunkerton Coop"},
-    {"name": "Heartland (Washburn)",        "url": "https://<HEARTLAND WASHBURN BIDS>",         "location": "Heartland Coop Washburn"},
-    {"name": "Mid-Iowa (La Porte City)",    "url": "https://<MID IOWA LPC BIDS>",               "location": "Mid-Iowa Coop La Porte City"},
-    {"name": "Shell Rock Soy Processing",   "url": "https://<SRSP BIDS PAGE>",                  "location": "Shell Rock Soy Processing"},
-    {"name": "POET Fairbank",               "url": "https://<POET FAIRBANK BIDS>",              "location": "POET Fairbank"},
-    {"name": "POET Shell Rock",             "url": "https://<POET SHELL ROCK BIDS>",            "location": "POET Shell Rock"},
-    # You may also list co-op pages that include delivery rows for ADM/Cargill below
-    {"name": "ADM via Co-ops",              "url": "https://<ANY COOP PAGE LISTING ADM CR>",    "location": "Various"},
-    {"name": "Cargill via Co-ops (Soy)",    "url": "https://<ANY COOP PAGE LISTING CARGILL CR>","location": "Various"},
+    {
+        "name": "Dunkerton Co-op (Source)",
+        "url": "https://www.dunkertoncoop.com/CashBids",
+        "location": "Dunkerton Co-op"
+    },
+    # Add more co-op pages here as you collect URLs...
 ]
 
 FUTURE_INPUT_DEFAULTS = {
@@ -32,38 +28,70 @@ FUTURE_INPUT_DEFAULTS = {
 
 MANUAL_FEED_URL = st.secrets.get("MANUAL_FEED_URL", "")
 
-# ── Processor routing (filter rows mentioning ADM CR or Cargill CR Soy) ─────
+# ── Processor routing: match ADM/Cargill/SRSP mentions on co-op pages ─────
 PROCESSOR_PATTERNS = [
-    {"name": "ADM Cedar Rapids", "patterns": [r"\badm\b.*cedar rapids", r"cedar rapids.*\badm\b", r"adm.*\bcr\b", r"\bcr\b.*adm"]},
-    {"name": "Cargill Cedar Rapids (Soy)", "patterns": [r"\bcargill\b.*cedar rapids", r"cedar rapids.*\bcargill\b", r"cargill.*\bcr\b", r"\bcr\b.*cargill"]},
+    {
+        "name": "ADM Cedar Rapids",
+        "patterns": [
+            r"\badm\b\s*[-–—:]*\s*cedar\s*rapids",
+            r"cedar\s*rapids\s*[-–—:]*\s*\badm\b",
+            r"\badm\b.*\bcr\b",
+            r"\bcr\b.*\badm\b",
+        ],
+    },
+    {
+        "name": "Cargill Cedar Rapids (Soy)",
+        "patterns": [
+            r"\bcargill\b\s*[-–—:]*\s*cedar\s*rapids",
+            r"cedar\s*rapids\s*[-–—:]*\s*\bcargill\b",
+            r"\bcargill\b.*\bcr\b",
+            r"\bcr\b.*\bcargill\b",
+            r"cargill.*soy",
+            r"soy.*cargill",
+        ],
+    },
+    {
+        "name": "Shell Rock Soy Processing",
+        "patterns": [
+            r"shell\s*rock\s*soy",
+            r"\bsrsp\b",
+        ],
+    },
 ]
 
 def route_rows_to_processors(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
+
+    # Normalize column names
     cols = {c.lower(): c for c in df.columns}
     delivery_col = cols.get("delivery") or next((c for c in df.columns if "deliv" in c.lower() or "month" in c.lower() or "period" in c.lower()), None)
     location_col = cols.get("location")
 
     work = df.copy()
+
+    # Prefer 'delivery' text; fallback to 'location'; else combine object columns
     if delivery_col:
-        text = work[delivery_col].astype(str).str.lower()
+        text = work[delivery_col].astype(str)
     elif location_col:
-        text = work[location_col].astype(str).str.lower()
+        text = work[location_col].astype(str)
     else:
-        text = (
-            work.select_dtypes(include=["object"])
-            .astype(str)
-            .apply(lambda r: " | ".join(r.values), axis=1)
-            .str.lower()
-        )
+        text = work.select_dtypes(include=["object"]).astype(str).apply(lambda r: " | ".join(r.values), axis=1)
+
+    # Clean punctuation spacing to make regex matches easier
+    text_norm = (
+        text.str.lower()
+            .str.replace(r"[\u2013\u2014–—]+", "-", regex=True)  # dashes
+            .str.replace(r"\s+", " ", regex=True)
+            .str.strip()
+    )
 
     keep_mask = pd.Series(False, index=work.index)
     resolved_location = pd.Series(pd.NA, index=work.index)
 
     for proc in PROCESSOR_PATTERNS:
         combined = re.compile("|".join(proc["patterns"]), flags=re.I)
-        hit = text.str.contains(combined, na=False)
+        hit = text_norm.str.contains(combined, na=False)
         resolved_location.loc[hit] = proc["name"]
         keep_mask = keep_mask | hit
 
@@ -77,7 +105,7 @@ def route_rows_to_processors(df: pd.DataFrame) -> pd.DataFrame:
         out["location"] = resolved_location.loc[out.index]
 
     if "source_site" not in out.columns:
-        out["source_site"] = pd.NA
+        out["source_site"] = "Dunkerton"
     return out.reset_index(drop=True)
 
 # ── FETCH + NORMALIZE ──────────────────────────────────────────────────────
@@ -102,8 +130,7 @@ def load_manual_feed() -> pd.DataFrame:
     if not MANUAL_FEED_URL:
         return pd.DataFrame()
     try:
-        df = pd.read_csv(MANUAL_FEED_URL)
-        return df
+        return pd.read_csv(MANUAL_FEED_URL)
     except Exception:
         return pd.DataFrame()
 
@@ -121,21 +148,19 @@ def recompute_basis_if_requested(df: pd.DataFrame, futures_overrides: Dict[str, 
     out.columns = [str(c).strip().lower() for c in out.columns]
     if "commodity" not in out.columns:
         for c in list(out.columns):
-            if any(k in c for k in ["commodity", "product", "crop"]):
+            if any(k in c for k in ["commodity","product","crop"]):
                 out = out.rename(columns={c: "commodity"})
                 break
     if "cash" in out.columns:
-        out = coerce_numeric(out, ["cash", "futures", "basis"])
+        out = coerce_numeric(out, ["cash","futures","basis"])
         for key, fut_val in futures_overrides.items():
             is_corn = "corn" in key.lower()
             is_soy  = "soy" in key.lower()
-            mask = pd.Series([False] * len(out))
+            mask = pd.Series([False]*len(out))
             if "commodity" in out.columns:
                 com = out["commodity"].astype(str).str.lower()
-                if is_corn:
-                    mask = mask | com.str.contains("corn", na=False)
-                if is_soy:
-                    mask = mask | com.str.contains("soy", na=False) | com.str.contains("bean", na=False)
+                if is_corn: mask = mask | com.str.contains("corn", na=False)
+                if is_soy:  mask = mask | com.str.contains("soy|bean|soybean", regex=True, na=False)
             if "futures" in out.columns:
                 out.loc[mask, "futures"] = fut_val
             else:
@@ -181,7 +206,7 @@ if not manual_df.empty:
 
 table = patch_duplicate_columns(table)
 
-# Keep ADM/Cargill rows when present on co-op pages (enabled by default)
+# Try routing rows to ADM/Cargill/SRSP. If matches found, prefer routed view.
 routed = route_rows_to_processors(table)
 if not routed.empty:
     table = routed
@@ -260,4 +285,4 @@ with col2:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-st.caption("Tip: If a co-op switches to a JavaScript-rendered table, point `resilient_fetch.py` to a CSV/JSON endpoint if available, or add a manual row via the optional Sheet/CSV feed.")
+st.caption("Tip: Add more co-op pages in COOPS. The app will keep only rows mentioning ADM Cedar Rapids, Cargill Cedar Rapids (Soy), or SRSP when found.")
