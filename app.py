@@ -25,7 +25,6 @@ PROCESSOR_PATTERNS = [
 ]
 
 def _series_or_first_col(x):
-    # If selecting a label with duplicate columns produced a DataFrame, take first col as Series
     return x.iloc[:,0] if isinstance(x, pd.DataFrame) else x
 
 def route_rows_to_processors(df: pd.DataFrame) -> pd.DataFrame:

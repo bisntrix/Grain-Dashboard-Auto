@@ -33,7 +33,20 @@ def _make_unique(cols):
             out.append(f"{c}_{seen[c]}")
     return out
 
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [" ".join([str(x) for x in tup if str(x) != 'nan']).strip() for tup in df.columns.values]
+    df.columns = _make_unique(df.columns)
+    return df
+
+def _strip_empty(df: pd.DataFrame) -> pd.DataFrame:
+    # drop rows/cols that are completely empty
+    df = df.dropna(how="all")
+    df = df.dropna(axis=1, how="all")
+    return df
+
 def read_tables_any(resp_text: str) -> List[pd.DataFrame]:
+    # Try both page-level and element-level parsing
     out = []
     for flavor in ["lxml", "html5lib"]:
         try:
@@ -49,64 +62,124 @@ def read_tables_any(resp_text: str) -> List[pd.DataFrame]:
                 pass
     except Exception:
         pass
-    # de-dup exact frames
-    dedup, seen = [], set()
+    # Clean/flatten/uniquify each
+    cleaned = []
     for df in out:
-        df = df.copy()
-        df.columns = _make_unique(df.columns)
-        sig = (tuple(map(str, df.columns)), df.shape)
-        if sig not in seen:
-            dedup.append(df)
-            seen.add(sig)
-    return dedup
+        try:
+            df = _flatten_columns(df.copy())
+            df = _strip_empty(df)
+            cleaned.append(df)
+        except Exception:
+            pass
+    return cleaned
 
-def normalize_bid_table(df: pd.DataFrame, location: str) -> pd.DataFrame:
+KEYWORDS_COL = re.compile(r"(comm|product|crop|deliv|month|period|basis|fut|cbot|price|cash|bid|location|loc|soy|bean|corn)", re.I)
+KEYWORDS_CELL = re.compile(r"(corn|soy|soybean|cedar\s*rapids|adm|cargill|srsp|shell\s*rock|basis|cash|bid|\$)", re.I)
+
+def _first_row_as_header_if_needed(df: pd.DataFrame) -> pd.DataFrame:
+    # If column names look generic/unnamed and first row has many keyword hits, promote it
+    col_hits = sum(bool(KEYWORDS_COL.search(str(c))) for c in df.columns)
+    if col_hits >= max(1, len(df.columns)//3):
+        return df
+    if df.empty: return df
+    first = df.iloc[0].astype(str)
+    cell_hits = sum(bool(KEYWORDS_CELL.search(x)) for x in first)
+    if cell_hits >= max(1, len(first)//3):
+        new_cols = [str(x).strip() for x in first]
+        rest = df.iloc[1:].copy()
+        rest.columns = _make_unique(new_cols)
+        return rest
+    return df
+
+def _long_form(df: pd.DataFrame) -> pd.DataFrame:
+    # Try to detect if commodities are in columns and need melting
+    cols_lower = [str(c).lower() for c in df.columns]
+    commodity_like_cols = [c for c in df.columns if re.search(r"corn|soy|bean|soybean", str(c), re.I)]
+    delivery_col = next((c for c in df.columns if re.search(r"deliv|month|period|delivery", str(c), re.I)), None)
+    location_col = next((c for c in df.columns if re.search(r"location|loc", str(c), re.I)), None)
+
+    if commodity_like_cols and delivery_col:
+        id_vars = [delivery_col] + ([location_col] if location_col else [])
+        melted = df.melt(id_vars=id_vars, value_vars=commodity_like_cols, var_name="commodity", value_name="cash")
+        return melted
+
+    # If commodities are in first column instead (rows), try renaming
+    first_col = df.columns[0]
+    if re.search(r"comm|product|crop", str(first_col), re.I):
+        # Looks already tidy enough
+        return df
+
+    # If first column values look like commodities
+    sample = df[first_col].astype(str).head(20).str.lower()
+    if sample.str.contains(r"corn|soy|bean|soybean", regex=True).any():
+        df = df.rename(columns={first_col: "commodity"})
+        return df
+
+    return df
+
+def normalize_bid_table_smart(df: pd.DataFrame, location: str) -> pd.DataFrame:
     df = df.copy()
-    # ensure unique column names before any Series ops
-    df.columns = _make_unique(df.columns)
-    df.columns = [re.sub(r"\s+", " ", str(c)).strip() for c in df.columns]
+    df = _flatten_columns(df)
+    df = _strip_empty(df)
+    df = _first_row_as_header_if_needed(df)
+    df = _long_form(df)
 
-    # map to standard names
+    # Standardize names
     cmap = {}
     for c in df.columns:
-        lc = c.lower()
-        if "comm" in lc or lc in {"commodity","crop","product"}: cmap[c]="commodity"
-        elif any(k in lc for k in ["deliv","month","period","delivery"]): cmap[c]="delivery"
+        lc = str(c).lower().strip()
+        if re.search(r"comm|product|crop", lc): cmap[c]="commodity"
+        elif re.search(r"deliv|month|period|delivery", lc): cmap[c]="delivery"
         elif "basis" in lc: cmap[c]="basis"
-        elif "fut" in lc or "cbot" in lc: cmap[c]="futures"
-        elif any(k in lc for k in ["cash","bid","price","$/bu","$ per bu","$/ bu"]): cmap.setdefault(c,"cash")
-        elif "loc" in lc: cmap[c]="location"
+        elif re.search(r"fut|cbot", lc): cmap[c]="futures"
+        elif re.search(r"cash|bid|price|\$/?\s*bu", lc): cmap.setdefault(c,"cash")
+        elif re.search(r"location|loc", lc): cmap[c]="location"
         else: cmap[c]=c
     df = df.rename(columns=cmap)
 
-    keep = [c for c in ["commodity","delivery","cash","basis","futures","location"] if c in df.columns]
-    if "cash" not in keep:
-        nums = [c for c in df.columns if c not in keep and pd.api.types.is_numeric_dtype(df[c])]
-        keep += nums[:1]
-    df = df[keep].copy() if keep else df
-
-    # clean numeric-like columns safely even if duplicates existed
+    # Clean numbers
     for col in ["cash","basis","futures"]:
         if col in df.columns:
             ser = df[col]
-            if isinstance(ser, pd.DataFrame):
-                ser = ser.iloc[:,0]
+            if isinstance(ser, pd.DataFrame): ser = ser.iloc[:,0]
             ser = ser.astype(str).str.replace(r"[^0-9.\-+]", "", regex=True).replace({"": None})
             df[col] = pd.to_numeric(ser, errors="coerce")
 
+    # Commodity filter only if it keeps some rows
     if "commodity" in df.columns:
         ser = df["commodity"]
-        if isinstance(ser, pd.DataFrame):
-            ser = ser.iloc[:,0]
+        if isinstance(ser, pd.DataFrame): ser = ser.iloc[:,0]
         m = ser.astype(str).str.lower().str.contains("corn|soy|bean|soybean", regex=True, na=False)
-        if m.any(): df = df[m].copy()
+        if m.any():
+            df = df[m].copy()
 
-    if "location" not in df.columns: df["location"] = location
+    # If we have melted cash from columns, ensure 'cash' is there or pick best numeric
+    if "cash" not in df.columns:
+        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if numeric_cols:
+            df = df.rename(columns={numeric_cols[0]:"cash"})
+
+    # Location stamp
+    if "location" not in df.columns:
+        df["location"] = location
+
+    # Compute basis if possible
     if "basis" not in df.columns and all(c in df.columns for c in ["cash","futures"]):
         df["basis"] = df["cash"] - df["futures"]
+
+    # Keep rows with some price info
     if "cash" in df.columns or "basis" in df.columns:
         df = df[(df.get("cash").notna() | df.get("basis").notna())]
+
+    # Delivery cleanup: keep short labels
+    if "delivery" in df.columns:
+        df["delivery"] = df["delivery"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+
     df["last_refresh_epoch"] = int(time.time())
+    # Keep key cols first
+    order = [c for c in ["commodity","delivery","cash","basis","futures","location","last_refresh_epoch"] if c in df.columns]
+    rest = [c for c in df.columns if c not in order]
+    df = df[order + rest]
     return df.reset_index(drop=True)
 
 def fetch_coop_table(url: str, location: str) -> Dict[str, Any]:
@@ -120,10 +193,18 @@ def fetch_coop_table(url: str, location: str) -> Dict[str, Any]:
         tables = read_tables_any(html)
         if not tables:
             return {"ok": False, "error": "no_tables_found", **meta, "status_code": resp.status_code, "content_len": len(html), "has_table_tag": "<table" in html.lower()}
-        tables.sort(key=lambda d: d.shape[0]*d.shape[1], reverse=True)
-        df = normalize_bid_table(tables[0], location)
-        if df.empty:
-            return {"ok": False, "error": "normalized_empty", **meta, "table_shape": tables[0].shape}
-        return {"ok": True, "data": df, **meta}
+        # Try to normalize each table; pick the one that yields most priced rows
+        best = None; best_rows = 0; best_shape = None
+        for t in tables:
+            try:
+                norm = normalize_bid_table_smart(t, location)
+                rows = len(norm)
+                if rows > best_rows:
+                    best_rows = rows; best = norm; best_shape = t.shape
+            except Exception:
+                continue
+        if best is None or best.empty:
+            return {"ok": False, "error": "normalized_empty", **meta, "table_shape": best_shape or (None,None)}
+        return {"ok": True, "data": best, **meta}
     except Exception as e:
         return {"ok": False, "error": f"parse_error: {e}", **meta}
