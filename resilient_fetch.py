@@ -71,7 +71,9 @@ def normalize_bid_table(df: pd.DataFrame, location: str) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     if "commodity" in df.columns:
         m = df["commodity"].astype(str).str.lower().str.contains("corn|soy|bean|soybean", regex=True, na=False)
-        if m.any(): df = df[m].copy()
+        # don't drop everything if none match
+        if m.any():
+            df = df[m].copy()
     if "location" not in df.columns: df["location"] = location
     if "basis" not in df.columns and all(c in df.columns for c in ["cash","futures"]):
         df["basis"] = df["cash"] - df["futures"]
@@ -87,9 +89,15 @@ def fetch_coop_table(url: str, location: str) -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": f"http_error: {e}", **meta}
     try:
-        tables = read_tables_any(resp.text)
+        html = resp.text
+        tables = read_tables_any(html)
         if not tables:
-            return {"ok": False, "error": "no_tables_found", **meta, "content_len": len(resp.text)}
+            return {
+                "ok": False, "error": "no_tables_found",
+                **meta, "status_code": resp.status_code,
+                "content_len": len(html),
+                "has_table_tag": "<table" in html.lower()
+            }
         tables.sort(key=lambda d: d.shape[0]*d.shape[1], reverse=True)
         df = normalize_bid_table(tables[0], location)
         if df.empty:
