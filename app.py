@@ -1,193 +1,259 @@
-# ===== TOP HEADER =====
-import streamlit as st
-import pandas as pd
+# app.py
+from __future__ import annotations
 
-from debug_shim import boot_banner, safe_render_df
-from patch_duplicate_columns import display_dataframe_safe
+import io
+import time
+from typing import List, Dict, Any
 
-# Show banner so you know the app started
-boot_banner()
-import requests
-from bs4 import BeautifulSoup  # only used if we need a fallback selector
 import pandas as pd
 import streamlit as st
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; GrainDashboard/1.0)"}
+# Local helpers you already have / added
+from resilient_fetch import fetch_coop_table
+from patch_duplicate_columns import patch_duplicate_columns
+from debug_shim import display_dataframe_safe  # safe wrapper around st.dataframe (your existing helper)
 
-def _read_html_first_table(url: str) -> pd.DataFrame:
-    # Try a few variants that often expose a clean server-rendered table
-    candidates = [url]
-    if "print=true" not in url:
-        sep = "&" if "?" in url else "?"
-        candidates.append(f"{url}{sep}print=true")
-    if "showcwt" not in url:
-        sep = "&" if "?" in url else "?"
-        candidates.append(f"{url}{sep}showcwt=0")
+st.set_page_config(page_title="Grain Marketing Dashboard", layout="wide")
 
-    last_err = None
-    for u in candidates:
-        try:
-            res = requests.get(u, headers=HEADERS, timeout=20)
-            res.raise_for_status()
-            tables = pd.read_html(res.text)
-            if tables:
-                df = max(tables, key=lambda t: t.shape[1]).copy()
-                df["__source_url__"] = u
-                return df
-        except Exception as e:
-            last_err = e
-            continue
-    raise ValueError("No tables found")
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ──────────────────────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_adm_cedar_rapids() -> pd.DataFrame:
-    # ADM Cedar Rapids via Agricharts proxy
-    url = "https://agriwaypartners.com/markets/cash.php?location_filter=18601"
-    return _read_html_first_table(url).assign(Location="ADM Cedar Rapids")
+# TODO: Replace each `url` with your real pages
+COOPS: List[Dict[str, str]] = [
+    {"name": "ADM Cedar Rapids",            "url": "https://<ADM BIDS PAGE>",                   "location": "ADM Cedar Rapids"},
+    {"name": "Cargill Cedar Rapids (Soy)",  "url": "https://<CARGILL SOY BIDS PAGE>",           "location": "Cargill Cedar Rapids (Soy)"},
+    {"name": "Dunkerton Coop",              "url": "https://<DUNKERTON BIDS PAGE>",             "location": "Dunkerton Coop"},
+    {"name": "Heartland (Washburn)",        "url": "https://<HEARTLAND WASHBURN BIDS>",         "location": "Heartland Coop Washburn"},
+    {"name": "Mid-Iowa (La Porte City)",    "url": "https://<MID IOWA LPC BIDS>",               "location": "Mid-Iowa Coop La Porte City"},
+    {"name": "Shell Rock Soy Processing",   "url": "https://<SRSP BIDS PAGE>",                  "location": "Shell Rock Soy Processing"},
+    {"name": "POET Fairbank",               "url": "https://<POET FAIRBANK BIDS>",              "location": "POET Fairbank"},
+    {"name": "POET Shell Rock",             "url": "https://<POET SHELL ROCK BIDS>",            "location": "POET Shell Rock"},
+]
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_cargill_cr_soy() -> pd.DataFrame:
-    # Cargill Cedar Rapids (Soy) via Agricharts location id
-    url = "https://www.dunkertoncoop.com/markets/cash.php?location_filter=82661"
-    return _read_html_first_table(url).assign(Location="Cargill Cedar Rapids (Soy)")
+FUTURE_INPUT_DEFAULTS = {
+    "Corn (ZC) nearby": 4.50,
+    "Soybeans (ZS) nearby": 11.50,
+}
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_dunkerton() -> pd.DataFrame:
-    # Clean table present; print mode simplifies HTML
-    url = "https://www.dunkertoncoop.com/markets/cash.php"
-    return _read_html_first_table(url).assign(Location="Dunkerton Coop")
-# Source page shows the cash prices table. :contentReference[oaicite:0]{index=0}
+# Optional: if you keep a Google Sheet (or CSV) with manual rows, put the URL in
+# Streamlit Secrets as st.secrets["MANUAL_FEED_URL"] (must be a direct csv export)
+MANUAL_FEED_URL = st.secrets.get("MANUAL_FEED_URL", "")
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_heartland_washburn() -> pd.DataFrame:
-    # Heartland’s ‘cash.php?location_filter=…’ pages render the same grid;
-    # use a location_filter that corresponds to Washburn.
-    url = "https://www.heartlandcoop.com/markets/cash.php?location_filter=19834"
-    return _read_html_first_table(url).assign(Location="Heartland Coop (Washburn)")
-# Heartland cash pages expose tables and support print mode; example cash.php endpoints shown. :contentReference[oaicite:3]{index=3}
+# ──────────────────────────────────────────────────────────────────────────────
+# FETCH + NORMALIZE
+# ──────────────────────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_mid_iowa_la_porte_city() -> pd.DataFrame:
-    # Mid Iowa’s site has multiple views; this one lists a combined grid incl. SRSP row
-    url = "https://www.midiowacoop.com/grains/cash-bids/"
-    return _read_html_first_table(url).assign(Location="Mid Iowa Coop (La Porte City)")
+@st.cache_data(ttl=10 * 60, show_spinner=True)
+def collect_all() -> tuple[pd.DataFrame, List[str], List[Dict[str, Any]]]:
+    """Try to fetch each co-op; return combined df, issues (strings), and raw debug info."""
+    frames: List[pd.DataFrame] = []
+    issues: List[str] = []
+    debug_rows: List[Dict[str, Any]] = []
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_poet_fairbank() -> pd.DataFrame:
-    url = "https://www.farmerswin.com/markets/cash.php?location_filter=79179"
-    return _read_html_first_table(url).assign(Location="POET Fairbank (Corn)")
+    for c in COOPS:
+        res = fetch_coop_table(c["url"], c["location"])
+        debug_rows.append(res)
+        if res.get("ok"):
+            frames.append(res["data"])
+        else:
+            issues.append(f'{c["name"]}: {res.get("error")}')
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_poet_shell_rock() -> pd.DataFrame:
-    url = "https://www.farmerswin.com/markets/cash.php?location_filter=79180"
-    return _read_html_first_table(url).assign(Location="POET Shell Rock (Corn)")
-# Shell Rock page has a standard Name/Delivery/Futures/Basis/$ Price table. :contentReference[oaicite:1]{index=1}
+    table = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return table, issues, debug_rows
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_srsp_via_mid_iowa() -> pd.DataFrame:
-    # SRSP’s own page asks you to call for bids. We’ll surface the SRSP line from Mid-Iowa’s grid (when present).
-    # If SRSP rows are present, we tag them specifically.
-    url = "https://www.midiowacoop.com/grains/cash-bids/"
-    df = _read_html_first_table(url)
-    # Try to filter rows that mention Shell Rock Soy Processing (SRSP)
-    mask = df.apply(lambda s: s.astype(str).str.contains("Shell Rock Soy", case=False, na=False)).any(axis=1)
-    df = df.loc[mask].copy()
-    if df.empty:
+
+def load_manual_feed() -> pd.DataFrame:
+    """Optional manual feed (CSV/Sheet) you can paste into st.secrets."""
+    if not MANUAL_FEED_URL:
         return pd.DataFrame()
-    return df.assign(Location="Shell Rock Soy Processing (via Mid Iowa)")
 
-def _normalize(df: pd.DataFrame, location_label: str = None) -> pd.DataFrame:
-    """
-    Normalize various vendor grids to a common schema:
-    ['Location','Commodity','DeliveryStart','DeliveryEnd','FuturesMonth','Futures','Basis','Cash']
-    Columns on vendor pages commonly include: Name, Delivery, Delivery End, Futures Month, Futures Price, Change, Basis, $ Price
-    """
-    d = df.copy()
-    # Keep only string column names
-    d.columns = [str(c).strip() for c in d.columns]
-    # Try to detect columns
-    def _first_match(cands):  # return first existing column
-        for c in cands:
-            if c in d.columns:
-                return c
-        return None
+    try:
+        df = pd.read_csv(MANUAL_FEED_URL)
+        # Expect columns roughly like: commodity, delivery, cash, basis, futures, location
+        # We'll be forgiving on column names; patch_duplicate_columns will help too.
+        return df
+    except Exception:
+        return pd.DataFrame()
 
-    col_name = _first_match(["Name","Commodity","Product"])
-    col_deliv = _first_match(["Delivery","Deliv Start","Delivery Start"])
-    col_deliv_end = _first_match(["Delivery End","Deliv End","End"])
-    col_fut_mo = _first_match(["Futures Month","Month","Option Month"])
-    col_fut_px = _first_match(["Futures Price","Futures","Board","Board Price"])
-    col_basis   = _first_match(["Basis","Basis (USD/bu)","Basis $"])
-    col_cash    = _first_match(["$ Price","Cash Price","Cash","Cash (USD/bu)"])
 
-    out = pd.DataFrame()
-    out["Location"] = location_label or d.get("Location", location_label)
-    out["Commodity"] = d[col_name] if col_name in d else None
-    out["DeliveryStart"] = d[col_deliv] if col_deliv in d else None
-    out["DeliveryEnd"] = d[col_deliv_end] if col_deliv_end in d else None
-    out["FuturesMonth"] = d[col_fut_mo] if col_fut_mo in d else None
-    out["Futures"] = pd.to_numeric(d[col_fut_px], errors="coerce") if col_fut_px in d else None
-    out["Basis"] = pd.to_numeric(d[col_basis], errors="coerce") if col_basis in d else None
-    out["Cash"]  = pd.to_numeric(d[col_cash], errors="coerce") if col_cash in d else None
-
-    # Some tables include both CORN & SOY rows in "Name" or similar; keep just the useful rows
-    # If no cash values, drop row
-    if "Cash" in out:
-        out = out.dropna(subset=["Cash"], how="all")
+def coerce_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    out = df.copy()
+    for col in cols:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
     return out
 
-with st.status("Fetching live cash bids…", expanded=False):
-    collected, errors = [], []
-    for fetcher in [
-        fetch_adm_cedar_rapids,
-        fetch_cargill_cr_soy,
-        fetch_dunkerton,
-        fetch_heartland_washburn,
-        fetch_mid_iowa_la_porte_city,
-        fetch_srsp_via_mid_iowa,
-        fetch_poet_fairbank,
-        fetch_poet_shell_rock,
-    ]:
-        try:
-            raw = fetcher()
-            if raw is None or raw.empty:
-                errors.append(f"{fetcher.__name__}: empty")
-                continue
-            loc_label = None
-            if "Location" in raw.columns:
-                try:
-                    loc_label = raw["Location"].iloc[0] if len(raw) else None
-                except Exception:
-                    pass
-            norm = _normalize(raw, location_label=loc_label)
-            if norm is not None and not norm.empty:
-                collected.append(norm)
+
+def recompute_basis_if_requested(df: pd.DataFrame, futures_overrides: Dict[str, float]) -> pd.DataFrame:
+    """If user enters current futures, we can recompute/override basis."""
+    if df.empty:
+        return df
+
+    out = df.copy()
+    out.columns = [str(c).strip().lower() for c in out.columns]
+
+    # Allow flexible 'commodity' labels
+    if "commodity" not in out.columns:
+        # try to infer: if there's a column with 'crop' or 'product'
+        for c in list(out.columns):
+            if any(k in c for k in ["commodity", "product", "crop"]):
+                out = out.rename(columns={c: "commodity"})
+                break
+
+    # If we have cash and commodity and user provided a futures override, set futures and basis
+    if "cash" in out.columns:
+        out = coerce_numeric(out, ["cash", "futures", "basis"])
+        for key, fut_val in futures_overrides.items():
+            # key like "Corn (ZC) nearby"; map using simple contains
+            is_corn = "corn" in key.lower()
+            is_soy  = "soy" in key.lower()
+            mask = pd.Series([False] * len(out))
+            if "commodity" in out.columns:
+                com = out["commodity"].astype(str).str.lower()
+                if is_corn:
+                    mask = mask | com.str.contains("corn", na=False)
+                if is_soy:
+                    mask = mask | com.str.contains("soy", na=False) | com.str.contains("bean", na=False)
+            # If futures column exists, override for the masked rows; else create it
+            if "futures" in out.columns:
+                out.loc[mask, "futures"] = fut_val
             else:
-                errors.append(f"{fetcher.__name__}: normalized empty")
-        except Exception as e:
-            errors.append(f"{fetcher.__name__}: {e}")
+                out["futures"] = pd.NA
+                out.loc[mask, "futures"] = fut_val
 
-# ---- AFTER status block: build bids_table and show any diagnostics ----
-if not collected:
+        # If futures now present, compute basis = cash - futures (but don't erase existing real basis)
+        if "futures" in out.columns:
+            if "basis" not in out.columns:
+                out["basis"] = pd.NA
+            # Only fill basis where missing
+            missing_basis = out["basis"].isna()
+            out.loc[missing_basis, "basis"] = out.loc[missing_basis, "cash"] - out.loc[missing_basis, "futures"]
+
+    return out
+
+
+def format_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    cols_order = [c for c in ["commodity", "delivery", "cash", "basis", "futures", "location", "last_refresh_epoch"] if c in df.columns]
+    rest = [c for c in df.columns if c not in cols_order]
+    df = df[cols_order + rest]
+    return df
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# UI
+# ──────────────────────────────────────────────────────────────────────────────
+
+st.title("Auto-fetched Cash Bids (beta)")
+
+with st.sidebar:
+    st.header("Options")
+    st.caption("Set fallback futures (optional) to compute basis when sites don’t provide it.")
+
+    futures_inputs = {}
+    for label, default_val in FUTURE_INPUT_DEFAULTS.items():
+        futures_inputs[label] = st.number_input(label, value=float(default_val), step=0.01, format="%.4f")
+
+    st.divider()
+    st.caption("Manual feed (optional)")
+    if MANUAL_FEED_URL:
+        st.success("Manual feed URL detected in secrets (MANUAL_FEED_URL).")
+    else:
+        st.info("Add MANUAL_FEED_URL to Streamlit secrets to merge a CSV/Sheet with custom rows.")
+
+# Try all live co-op pages
+table, issues, debug_rows = collect_all()
+
+# Merge optional manual feed
+manual_df = load_manual_feed()
+if not manual_df.empty:
+    table = pd.concat([table, manual_df], ignore_index=True)
+
+# If nothing live came back, show diagnostics and demo rows (so the app still feels alive)
+if table.empty:
     st.warning("No live tables were collected. Showing diagnostics and fallback demo rows.")
-    if errors:
-        st.write("Fetch issues:")
-        st.code("\n".join(errors))
-    bids_table = pd.DataFrame([
-        {"Location":"ADM Cedar Rapids","Commodity":"CORN","FuturesMonth":"Dec","Futures":4.60,"Basis":-0.12,"Cash":4.48},
-        {"Location":"Cargill Cedar Rapids (Soy)","Commodity":"SOYBEANS","FuturesMonth":"Nov","Futures":11.50,"Basis":-0.08,"Cash":11.42},
-    ])
-else:
-    bids_table = pd.concat(collected, ignore_index=True)
-# Fallback demo rows if still empty:
-if bids_table.empty:
-    bids_table = pd.DataFrame([
-        {"Location":"ADM Cedar Rapids","Commodity":"CORN","FuturesMonth":"Dec","Futures":4.60,"Basis":-0.12,"Cash":4.48},
-        {"Location":"Cargill Cedar Rapids (Soy)","Commodity":"SOYBEANS","FuturesMonth":"Nov","Futures":11.50,"Basis":-0.08,"Cash":11.42},
-    ])
 
-# ✅ Final table for render
-table = bids_table[["Location","Commodity","FuturesMonth","Futures","Basis","Cash"]]
-# ===== END LIVE FETCH =====
-safe_render_df(table, use_container_width=True, height=420)
-# ===== END RENDER =====
+    if issues:
+        with st.expander("Fetch issues (per site)"):
+            for i in issues:
+                st.write("•", i)
+
+    # Always keep the app usable with a tiny demo table:
+    demo = pd.DataFrame(
+        {
+            "commodity": ["Corn", "Soybeans"],
+            "delivery": ["Nearby", "Nearby"],
+            "cash": [4.20, 10.85],
+            "basis": [-0.35, -0.90],
+            "location": ["Demo Location A", "Demo Location B"],
+            "last_refresh_epoch": [int(time.time())] * 2,
+        }
+    )
+    demo = patch_duplicate_columns(demo)
+    display_dataframe_safe(demo, use_container_width=True, height=420)
+
+    st.stop()
+
+# We have at least some data — patch dupes, allow futures override, and format
+table = patch_duplicate_columns(table)
+table = recompute_basis_if_requested(table, futures_inputs)
+table = format_for_display(table)
+
+# Summary header
+num_rows = len(table)
+num_locs = table["location"].nunique() if "location" in table.columns else None
+msg = f"Collected **{num_rows}** rows"
+if num_locs:
+    msg += f" from **{num_locs}** location(s)"
+st.success(msg)
+
+# Main grid
+display_dataframe_safe(table, use_container_width=True, height=520)
+
+# Diagnostics panel
+with st.expander("Diagnostics"):
+    st.write("Last refresh:", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
+    if issues:
+        st.write("**Fetch issues:**")
+        for i in issues:
+            st.write("•", i)
+    else:
+        st.write("No fetch issues reported.")
+    st.write("Raw results sample:")
+    st.json(debug_rows[:3])
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EXPORTS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="bids")
+        # Autofit columns (roughly)
+        for idx, col in enumerate(df.columns):
+            width = min(40, max(10, int(df[col].astype(str).str.len().mean() + 5)))
+            writer.sheets["bids"].set_column(idx, idx, width)
+    return output.getvalue()
+
+col1, col2 = st.columns(2)
+with col1:
+    csv_bytes = table.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Download CSV",
+        data=csv_bytes,
+        file_name="cash_bids.csv",
+        mime="text/csv"
+    )
+with col2:
+    xlsx_bytes = to_excel_bytes(table)
+    st.download_button(
+        "⬇️ Download Excel",
+        data=xlsx_bytes,
+        file_name="cash_bids.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+st.caption("Tip: If a co-op switches to a JavaScript-rendered table, point `resilient_fetch.py` to a CSV/JSON endpoint if available, or add a manual row via the optional Sheet/CSV feed.")
