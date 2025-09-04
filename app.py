@@ -28,33 +28,56 @@ def _series_or_first_col(x):
     return x.iloc[:,0] if isinstance(x, pd.DataFrame) else x
 
 def route_rows_to_processors(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
-    cols = {c.lower(): c for c in df.columns}
-    delivery_col = cols.get("delivery") or next((c for c in df.columns if "deliv" in c.lower() or "month" in c.lower() or "period" in c.lower()), None)
-    location_col = cols.get("location")
+    if df.empty:
+        return df
+
     work = df.copy()
+    cols = {c.lower(): c for c in work.columns}
+    delivery_col = cols.get("delivery") or next(
+        (c for c in work.columns if re.search(r"deliv|month|period", str(c), re.I)), 
+        None
+    )
+    location_col = cols.get("location")
+
+    # Build the text to scan for processor keywords
     if delivery_col:
         text = _series_or_first_col(work[delivery_col].astype(str))
     elif location_col:
         text = _series_or_first_col(work[location_col].astype(str))
     else:
         text = work.select_dtypes(include=["object"]).astype(str).apply(lambda r: " | ".join(r.values), axis=1)
-    text_norm = (text.str.lower().str.replace(r"[\u2013\u2014–—]+", "-", regex=True).str.replace(r"\s+", " ", regex=True).str.strip())
-    keep_mask = pd.Series(False, index=work.index)
+
+    text_norm = (
+        text.str.lower()
+            .str.replace(r"[\u2013\u2014–—]+", "-", regex=True)
+            .str.replace(r"\s+", " ", regex=True)
+            .str.strip()
+    )
+
+    # Track which rows match any processor
+    hits = pd.Series(False, index=work.index)
     resolved_location = pd.Series(pd.NA, index=work.index)
+
     for proc in PROCESSOR_PATTERNS:
         combined = re.compile("|".join(proc["patterns"]), flags=re.I)
         hit = text_norm.str.contains(combined, na=False)
         resolved_location.loc[hit] = proc["name"]
-        keep_mask = keep_mask | hit
-    out = work[keep_mask].copy()
-    if out.empty: return out
+        hits = hits | hit
+
+    out = work.copy()
+
+    # Create/adjust location column
     if "location" in out.columns:
-        out["location"] = resolved_location.loc[out.index].fillna(out["location"])
+        out.loc[hits, "location"] = resolved_location.loc[hits]
     else:
-        out["location"] = resolved_location.loc[out.index]
+        out["location"] = resolved_location
+        # If we didn’t resolve a processor, keep original site label
+        out["location"] = out["location"].fillna("Dunkerton")
+
     if "source_site" not in out.columns:
         out["source_site"] = "Dunkerton"
+
+    # IMPORTANT: Do NOT drop non-matches. Keep everything.
     return out.reset_index(drop=True)
 
 @st.cache_data(ttl=10 * 60, show_spinner=True)
