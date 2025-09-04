@@ -1,5 +1,5 @@
 from __future__ import annotations
-import re, time, requests, pandas as pd
+import re, time, io, requests, pandas as pd
 from typing import List, Dict, Any
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
@@ -12,7 +12,7 @@ def http_get(url: str, timeout: int = 20) -> requests.Response:
         url,
         headers={
             "User-Agent": UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/csv;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
@@ -41,28 +41,27 @@ def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _strip_empty(df: pd.DataFrame) -> pd.DataFrame:
-    # drop rows/cols that are completely empty
     df = df.dropna(how="all")
     df = df.dropna(axis=1, how="all")
     return df
 
-TABLE_MATCH = re.compile(r"(corn|soy|soybean|cash|basis|bid|cbot|fut|delivery|month)", re.I)
+TABLE_MATCH = re.compile(r"(corn|soy|soybean|cash|basis|bid|cbot|fut|delivery|month|price)", re.I)
 
 def read_tables_any(resp_text: str, base_url: str | None = None) -> Dict[str, Any]:
-    """
-    Return parsed tables + rich diagnostics. Will try page-level, element-level, and iframe-level.
-    """
     diagnostics = {
         "page_tables_found": 0,
         "page_table_shapes": [],
         "iframe_urls_tried": [],
         "iframe_tables_found": 0,
         "iframe_table_shapes": [],
+        "csv_urls_tried": [],
+        "csv_tables_found": 0,
+        "csv_table_shapes": [],
         "snippets": [],
     }
     all_tables: List[pd.DataFrame] = []
 
-    # 1) Page-level attempts with/without "match"
+    # Try HTML at page-level with/without match
     for flavor in ["lxml", "html5lib"]:
         for match_expr in [None, TABLE_MATCH]:
             try:
@@ -74,7 +73,7 @@ def read_tables_any(resp_text: str, base_url: str | None = None) -> Dict[str, An
             except Exception:
                 pass
 
-    # 2) Element-level: each <table> individually
+    # Element-level tables
     try:
         soup = BeautifulSoup(resp_text, "html.parser")
         for t in soup.find_all("table"):
@@ -89,7 +88,37 @@ def read_tables_any(resp_text: str, base_url: str | None = None) -> Dict[str, An
     except Exception:
         pass
 
-    # 3) Follow iframes that look relevant (common for embedded cash bids)
+    # CSV export link (e.g., /markets/cashbid-download.php)
+    try:
+        soup = BeautifulSoup(resp_text, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if re.search(r"cashbid[-_]download\\.php", href, re.I):
+                target = urljoin(base_url, href) if base_url else href
+                diagnostics["csv_urls_tried"].append(target)
+                try:
+                    r_csv = http_get(target, timeout=20)
+                    # Attempt to parse CSV; sometimes it's HTML disguised, so try both
+                    text = r_csv.text
+                    parsed = None
+                    try:
+                        parsed = pd.read_csv(io.StringIO(text))
+                    except Exception:
+                        try:
+                            parsed = pd.read_html(text)[0]
+                        except Exception:
+                            parsed = None
+                    if isinstance(parsed, pd.DataFrame):
+                        parsed = _strip_empty(_flatten_columns(parsed))
+                        all_tables.append(parsed)
+                        diagnostics["csv_tables_found"] += 1
+                        diagnostics["csv_table_shapes"].append(getattr(parsed, "shape", None))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Follow iframes (in case CSV not present and table is in embedded page)
     try:
         soup = BeautifulSoup(resp_text, "html.parser")
         iframes = soup.find_all("iframe")
@@ -97,14 +126,12 @@ def read_tables_any(resp_text: str, base_url: str | None = None) -> Dict[str, An
             src = iframe.get("src") or ""
             if not src:
                 continue
-            # Heuristic: only chase iframes that look remotely relevant
             if re.search(r"(bid|bids|cash|market|quote|grain|table)", src, re.I):
                 target = urljoin(base_url, src) if base_url else src
                 diagnostics["iframe_urls_tried"].append(target)
                 try:
                     r_if = http_get(target, timeout=20)
                     if r_if.ok:
-                        # Try same combinations on iframe content
                         for flavor in ["lxml", "html5lib"]:
                             for match_expr in [None, TABLE_MATCH]:
                                 try:
@@ -115,26 +142,12 @@ def read_tables_any(resp_text: str, base_url: str | None = None) -> Dict[str, An
                                         diagnostics["iframe_table_shapes"].append(getattr(t, "shape", None))
                                 except Exception:
                                     pass
-                        try:
-                            soup_if = BeautifulSoup(r_if.text, "html.parser")
-                            for t in soup_if.find_all("table"):
-                                try:
-                                    tables = pd.read_html(str(t))
-                                    for df in tables:
-                                        all_tables.append(df)
-                                        diagnostics["iframe_tables_found"] += 1
-                                        diagnostics["iframe_table_shapes"].append(getattr(df, "shape", None))
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
                 except Exception:
-                    # Ignore unreachable iframes; they’ll show up in diagnostics as tried
                     pass
     except Exception:
         pass
 
-    # Clean/flatten/uniquify each
+    # Clean and preview
     cleaned = []
     for df in all_tables:
         try:
@@ -144,7 +157,6 @@ def read_tables_any(resp_text: str, base_url: str | None = None) -> Dict[str, An
         except Exception:
             pass
 
-    # small preview snippet for first few tables
     diagnostics["snippets"] = []
     for i, t in enumerate(cleaned[:3]):
         try:
@@ -156,27 +168,22 @@ def read_tables_any(resp_text: str, base_url: str | None = None) -> Dict[str, An
     return {"tables": cleaned, "diagnostics": diagnostics}
 
 def _long_form(df: pd.DataFrame) -> pd.DataFrame:
-    # Try to detect if commodities are in columns and need melting
     commodity_like_cols = [c for c in df.columns if re.search(r"corn|soy|bean|soybean", str(c), re.I)]
     delivery_col = next((c for c in df.columns if re.search(r"deliv|month|period|delivery", str(c), re.I)), None)
-    location_col = next((c for c in df.columns if re.search(r"location|loc", str(c), re.I)), None)
+    location_col = next((c for c in df.columns if re.search(r"location|loc|name", str(c), re.I)), None)
 
     if commodity_like_cols:
         id_vars = []
-        if delivery_col:
-            id_vars.append(delivery_col)
-        if location_col:
-            id_vars.append(location_col)
+        if delivery_col: id_vars.append(delivery_col)
+        if location_col: id_vars.append(location_col)
         try:
             melted = df.melt(id_vars=id_vars, value_vars=commodity_like_cols, var_name="commodity", value_name="cash")
             return melted
         except Exception:
-            pass  # fall through to other heuristics
+            pass
 
-    # If first column looks like commodity labels
     first_col = df.columns[0]
     if re.search(r"comm|product|crop", str(first_col), re.I):
-        # Looks already tidy enough
         return df
 
     sample = df[first_col].astype(str).head(20).str.lower()
@@ -192,79 +199,73 @@ def normalize_bid_table_smart(df: pd.DataFrame, location: str) -> pd.DataFrame:
     df = _strip_empty(df)
     df = _long_form(df)
 
-    # Standardize names
+    # Map common column names (including Barchart export)
     cmap: Dict[str, str] = {}
     for c in df.columns:
         lc = str(c).lower().strip()
         if re.search(r"comm|product|crop", lc): cmap[c] = "commodity"
-        elif re.search(r"deliv|month|period|delivery", lc): cmap[c] = "delivery"
+        elif re.search(r"^delivery(\\s|$)|deliv|month|period", lc): cmap[c] = "delivery"
+        elif re.search(r"delivery\\s*start", lc): cmap[c] = "delivery_start"
+        elif re.search(r"delivery\\s*end", lc): cmap[c] = "delivery_end"
+        elif lc == "name": cmap[c] = "location"
         elif "basis" in lc: cmap[c] = "basis"
         elif re.search(r"fut|cbot", lc): cmap[c] = "futures"
-        elif re.search(r"cash|bid|price|\$/?\s*bu", lc): cmap.setdefault(c, "cash")
+        elif re.search(r"(\\$\\s*price|^price$|cash|bid)", lc): cmap.setdefault(c, "cash")
         elif re.search(r"location|loc", lc): cmap[c] = "location"
         else: cmap[c] = c
     df = df.rename(columns=cmap)
 
-    # If no delivery survived, default to Nearby
+    # If only start/end are present, create a compact 'delivery'
+    if "delivery" not in df.columns and ("delivery_start" in df.columns or "delivery_end" in df.columns):
+        start = df.get("delivery_start").astype(str) if "delivery_start" in df.columns else ""
+        end = df.get("delivery_end").astype(str) if "delivery_end" in df.columns else ""
+        combo = (start.fillna("") + "–" + end.fillna("")).str.strip("– ").replace({"–": "Nearby"})
+        df["delivery"] = combo.replace({"": "Nearby"})
+
     if "delivery" not in df.columns:
         df["delivery"] = "Nearby"
 
-    # Clean numbers (cash/basis/futures if present)
+    # Clean numeric columns
     for col in ["cash", "basis", "futures"]:
         if col in df.columns:
             ser = df[col]
-            if isinstance(ser, pd.DataFrame):
-                ser = ser.iloc[:, 0]
-            ser = ser.astype(str).str.replace(r"[^0-9.\-+]", "", regex=True).replace({"": None})
+            if isinstance(ser, pd.DataFrame): ser = ser.iloc[:, 0]
+            ser = ser.astype(str).str.replace(r"[^0-9.\\-+]", "", regex=True).replace({"": None})
             df[col] = pd.to_numeric(ser, errors="coerce")
 
-    # If still no 'cash', try to pick best numeric column as cash
+    # If missing 'cash', choose a reasonable numeric column
     if "cash" not in df.columns:
         numeric_candidates = []
         for c in df.columns:
             try:
-                vals = pd.to_numeric(
-                    df[c].astype(str).str.replace(r"[^0-9.\-+]", "", regex=True),
-                    errors="coerce"
-                )
-                if vals.notna().sum() >= max(1, len(vals) // 3):
+                vals = pd.to_numeric(df[c], errors="coerce")
+                if vals.notna().sum() >= max(1, len(df)//3):
                     numeric_candidates.append((c, vals.notna().sum()))
             except Exception:
                 pass
         if numeric_candidates:
             numeric_candidates.sort(key=lambda x: x[1], reverse=True)
-            best_col = numeric_candidates[0][0]
-            df = df.rename(columns={best_col: "cash"})
-            df["cash"] = pd.to_numeric(
-                df["cash"].astype(str).str.replace(r"[^0-9.\-+]", "", regex=True),
-                errors="coerce"
-            )
+            best = numeric_candidates[0][0]
+            df = df.rename(columns={best: "cash"})
 
-    # Commodity filter only if it keeps some rows
+    # Filter commodity labels if present
     if "commodity" in df.columns:
         m = df["commodity"].astype(str).str.lower().str.contains("corn|soy|bean|soybean", regex=True, na=False)
         if m.any():
             df = df[m].copy()
 
-    # Location stamp
     if "location" not in df.columns:
         df["location"] = location
 
-    # Compute basis if possible
     if "basis" not in df.columns and all(c in df.columns for c in ["cash", "futures"]):
         df["basis"] = df["cash"] - df["futures"]
 
-    # Keep rows with some price info
     if "cash" in df.columns or "basis" in df.columns:
         df = df[(df.get("cash").notna() | df.get("basis").notna())]
 
-    # Delivery cleanup: keep short labels
-    if "delivery" in df.columns:
-        df["delivery"] = df["delivery"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
-
+    df["delivery"] = df["delivery"].astype(str).str.replace(r"\\s+", " ", regex=True).str.strip()
     df["last_refresh_epoch"] = int(time.time())
-    # Keep key cols first
-    order = [c for c in ["commodity", "delivery", "cash", "basis", "futures", "location", "last_refresh_epoch"] if c in df.columns]
+    order = [c for c in ["commodity","delivery","cash","basis","futures","location","last_refresh_epoch"] if c in df.columns]
     rest = [c for c in df.columns if c not in order]
     return df[order + rest].reset_index(drop=True)
 
@@ -290,7 +291,7 @@ def fetch_coop_table(url: str, location: str) -> Dict[str, Any]:
                 "has_table_tag": "<table" in html.lower(),
                 "diags": diags,
             }
-        # Try to normalize each table; pick the one that yields most priced rows
+
         best = None; best_rows = 0; best_shape = None; best_preview = None
         per_table_meta = []
         for idx, t in enumerate(tables):

@@ -188,30 +188,6 @@ with st.expander("Live Fetch Debug"):
 
 if table.empty:
     st.warning("No live tables were collected. Showing diagnostics and fallback demo rows.")
-
-    # ← SHOW RICH DIAGNOSTICS EVEN WHEN EMPTY
-    with st.expander("Diagnostics (raw results sample)"):
-        st.write("Issues:", issues or "None")
-        for i, row in enumerate(debug_rows):
-            st.subheader(f"Source #{i+1}: {row.get('location')} — {row.get('url')}")
-            st.write({"ok": row.get("ok"), "error": row.get("error"), "best_table_shape": row.get("best_table_shape")})
-            diags = row.get("diags") or {}
-            st.write({
-                "page_tables_found": diags.get("page_tables_found"),
-                "page_table_shapes": diags.get("page_table_shapes"),
-                "iframe_urls_tried": diags.get("iframe_urls_tried"),
-                "iframe_tables_found": diags.get("iframe_tables_found"),
-                "iframe_table_shapes": diags.get("iframe_table_shapes"),
-            })
-            best_preview = (diags.get("best_preview") if isinstance(diags, dict) else None)
-            if best_preview:
-                st.caption("Best raw table head (pre-normalization):")
-                st.json(best_preview)
-            if row.get("ok") and isinstance(row.get("data"), pd.DataFrame):
-                st.caption("Normalized sample:")
-                display_dataframe_safe(row["data"].head(10), use_container_width=True, height=240)
-
-    # Demo rows so the page isn't blank
     demo = pd.DataFrame({
         "commodity": ["Corn", "Soybeans"],
         "delivery": ["Nearby", "Nearby"],
