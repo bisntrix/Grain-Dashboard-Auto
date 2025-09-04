@@ -1,17 +1,6 @@
-from __future__ import annotations
 import pandas as pd
 
 def patch_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
-    cols = list(map(str, df.columns))
-    seen = {}
-    new_cols = []
-    for c in cols:
-        if c not in seen:
-            seen[c] = 1
-            new_cols.append(c)
-        else:
-            seen[c] += 1
-            new_cols.append(f"{c}_{seen[c]}")
-    out = df.copy()
-    out.columns = new_cols
-    return out
+    df = df.copy()
+    df.columns = pd.io.parsers.ParserBase({'names':df.columns})._maybe_dedup_names(df.columns)
+    return df
