@@ -92,30 +92,112 @@ def _first_row_as_header_if_needed(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _long_form(df: pd.DataFrame) -> pd.DataFrame:
-    # Try to detect if commodities are in columns and need melting
     cols_lower = [str(c).lower() for c in df.columns]
     commodity_like_cols = [c for c in df.columns if re.search(r"corn|soy|bean|soybean", str(c), re.I)]
     delivery_col = next((c for c in df.columns if re.search(r"deliv|month|period|delivery", str(c), re.I)), None)
     location_col = next((c for c in df.columns if re.search(r"location|loc", str(c), re.I)), None)
 
-    if commodity_like_cols and delivery_col:
-        id_vars = [delivery_col] + ([location_col] if location_col else [])
-        melted = df.melt(id_vars=id_vars, value_vars=commodity_like_cols, var_name="commodity", value_name="cash")
-        return melted
+    # If commodity columns exist, melt them even if no delivery column
+    if commodity_like_cols:
+        id_vars = []
+        if delivery_col: id_vars.append(delivery_col)
+        if location_col: id_vars.append(location_col)
+        try:
+            melted = df.melt(id_vars=id_vars, value_vars=commodity_like_cols, var_name="commodity", value_name="cash")
+            return melted
+        except Exception:
+            pass  # fall through to other heuristics
 
-    # If commodities are in first column instead (rows), try renaming
+    # If first column looks like commodity labels
     first_col = df.columns[0]
     if re.search(r"comm|product|crop", str(first_col), re.I):
-        # Looks already tidy enough
         return df
 
-    # If first column values look like commodities
     sample = df[first_col].astype(str).head(20).str.lower()
     if sample.str.contains(r"corn|soy|bean|soybean", regex=True).any():
         df = df.rename(columns={first_col: "commodity"})
         return df
 
     return df
+
+
+def normalize_bid_table_smart(df: pd.DataFrame, location: str) -> pd.DataFrame:
+    df = df.copy()
+    df = _flatten_columns(df)
+    df = _strip_empty(df)
+    df = _first_row_as_header_if_needed(df)
+    df = _long_form(df)
+
+    # Standardize names
+    cmap = {}
+    for c in df.columns:
+        lc = str(c).lower().strip()
+        if re.search(r"comm|product|crop", lc): cmap[c] = "commodity"
+        elif re.search(r"deliv|month|period|delivery", lc): cmap[c] = "delivery"
+        elif "basis" in lc: cmap[c] = "basis"
+        elif re.search(r"fut|cbot", lc): cmap[c] = "futures"
+        elif re.search(r"cash|bid|price|\$/?\s*bu", lc): cmap.setdefault(c, "cash")
+        elif re.search(r"location|loc", lc): cmap[c] = "location"
+        else: cmap[c] = c
+    df = df.rename(columns=cmap)
+
+    # If no delivery survived, default to Nearby
+    if "delivery" not in df.columns:
+        df["delivery"] = "Nearby"
+
+    # Clean numbers (cash/basis/futures if present)
+    for col in ["cash", "basis", "futures"]:
+        if col in df.columns:
+            ser = df[col]
+            if isinstance(ser, pd.DataFrame):
+                ser = ser.iloc[:, 0]
+            ser = ser.astype(str).str.replace(r"[^0-9.\-+]", "", regex=True).replace({"": None})
+            df[col] = pd.to_numeric(ser, errors="coerce")
+
+    # If still no 'cash', try to pick best numeric column as cash
+    if "cash" not in df.columns:
+        numeric_candidates = []
+        for c in df.columns:
+            try:
+                vals = pd.to_numeric(
+                    df[c].astype(str).str.replace(r"[^0-9.\-+]", "", regex=True),
+                    errors="coerce"
+                )
+                if vals.notna().sum() >= max(1, len(vals) // 3):
+                    numeric_candidates.append((c, vals.notna().sum()))
+            except Exception:
+                pass
+        if numeric_candidates:
+            numeric_candidates.sort(key=lambda x: x[1], reverse=True)
+            best_col = numeric_candidates[0][0]
+            df = df.rename(columns={best_col: "cash"})
+            df["cash"] = pd.to_numeric(
+                df["cash"].astype(str).str.replace(r"[^0-9.\-+]", "", regex=True),
+                errors="coerce"
+            )
+
+    if "commodity" in df.columns:
+        m = df["commodity"].astype(str).str.lower().str.contains("corn|soy|bean|soybean", regex=True, na=False)
+        if m.any():
+            df = df[m].copy()
+
+    if "location" not in df.columns:
+        df["location"] = location
+
+    if "basis" not in df.columns and all(c in df.columns for c in ["cash", "futures"]):
+        df["basis"] = df["cash"] - df["futures"]
+
+    # Keep rows with some price info if possible
+    if "cash" in df.columns or "basis" in df.columns:
+        df = df[(df.get("cash").notna() | df.get("basis").notna())]
+
+    if "delivery" in df.columns:
+        df["delivery"] = df["delivery"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+
+    df["last_refresh_epoch"] = int(time.time())
+    order = [c for c in ["commodity", "delivery", "cash", "basis", "futures", "location", "last_refresh_epoch"] if c in df.columns]
+    rest = [c for c in df.columns if c not in order]
+    return df[order + rest].reset_index(drop=True)
 
 def normalize_bid_table_smart(df: pd.DataFrame, location: str) -> pd.DataFrame:
     df = df.copy()
